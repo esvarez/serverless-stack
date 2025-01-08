@@ -1,0 +1,10 @@
+version = 0.1
+[prod.deploy.parameters]
+stack_name = "Noctowl-app"
+resolve_s3 = false
+s3_prefix = "Noctowl-app"
+region = "us-west-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "env=\"prod\" RootDomainName=\"boardgamemate.com\""
+image_repositories = []

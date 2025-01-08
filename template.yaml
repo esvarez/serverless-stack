@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Monolith-esque API Go Lambda
+
+Parameters:
+  env:
+    Type: String
+    Description: The environment name
+    Default: local
+  RootDomainName:
+    Type: String
+    Description: The root domain name
+
+Conditions:
+  CreateLocalResources: !Equals [ !Ref env, local ]
+  CreateProdResources: !Equals [ !Ref env, prod ]
+
+Globals:
+  Function:
+    Timeout: 5
+    Runtime: go1.x
+    Architectures:
+      - x86_64
+
+Resources:
+
+  GatewayApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref env
+      CacheClusterEnabled: false
+      CacheClusterSize: '0.5'
+      Cors:
+        AllowMethods:
+          - 'GET'
+          - 'POST'
+          - 'PUT'
+          - 'DELETE'
+          - 'PATCH'
+          - 'OPTIONS'
+        AllowHeaders: "'*'"
+        AllowOrigin: "'*'"
+        AllowCredentials: false
+      Auth:
+        AddDefaultAuthorizerToCorsPreflight: false
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt CognitoUserPool.Arn
+            Identity:
+              Header: Authorization
+              ReauthorizeEvery: 30
+
+ # Table resource
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !If [CreateProdResources, 'table-name', !Sub 'table-name-${env}']
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI
+          AttributeType: S
+        - AttributeName: GSIRange
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSIDateIndex
+          KeySchema:
+            - AttributeName: GSI
+              KeyType: HASH
+            - AttributeName: GSIRange
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # Auth resource
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !If [CreateProdResources, 'Noctowl-auth', !Sub 'Noctowl-auth-${env}']
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireUppercase: true
+      UsernameAttributes:
+        - email
+      Schema:
+        - AttributeDataType: String
+          Name: email
+          Required: false
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !If [CreateProdResources, 'Noctowl-client', !Sub 'Noctowl-client-${env}']
+      UserPoolId: !Ref CognitoUserPool
+      CallbackURLs:
+        - 'http://localhost'
+        - 'https://jwt.io'
+        - !If [CreateProdResources, !Sub 'https://${RootDomainName}', !Sub 'https://${env}.${RootDomainName}']
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthScopes:
+        - phone
+        - email
+        - openid
+      SupportedIdentityProviders:
+        - COGNITO
+      AllowedOAuthFlowsUserPoolClient: true
+      GenerateSecret: false
+
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !If [CreateProdResources, 'noctowl-auth', !Sub 'noctowl-auth-${env}']
+      UserPoolId: !Ref CognitoUserPool
+
+  RootBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !If [CreateProdResources, !Sub '${RootDomainName}', !Sub '${env}.${RootDomainName}']
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+
+  WWWBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !If [CreateProdResources, !Sub 'www.${RootDomainName}', !Sub 'app-${env}.${RootDomainName}']
+      AccessControl: BucketOwnerFullControl
+      WebsiteConfiguration:
+        RedirectAllRequestsTo:
+          HostName: !Ref RootBucket
+          Protocol: http
+
+  DNS:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      HostedZoneConfig:
+        Comment: !Sub 'Hosted Zone for ${RootDomainName}'
+      Name: !Ref RootDomainName
+
+  RootBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref RootBucket
+      PolicyDocument:
+        Id: MyPolicy
+        Version: 2012-10-17
+        Statement:
+          - Sid: PublicReadForGetBucketObjects
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref RootBucket
+                - /*
+
+  ConfirmUserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./cmd
+      Handler: functions/confirm_user/main
+      Runtime: go1.x
+      Events:
+        CognitoPreSignup:
+          Type: Cognito
+          Properties:
+            UserPool: !Ref CognitoUserPool
+            Trigger: PreSignUp
+
+  # Tamplate lambda function
+  AddGameFunction:
+    Type: AWS::Serverless::Function
+    Connectors:
+      TableConnector:
+        Properties:
+          Destination:
+            Id: DynamoDBTable
+          Permissions:
+            - Write
+    Properties:
+      CodeUri: ./cmd
+      Handler: functions/add_game/main
+      Runtime: go1.x
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName:
+              !Ref GetGameDetailsFunction
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DynamoDBTable
+          GET_GAME_LAMBDA_NAME: !If [CreateLocalResources, 'Noctowl-app-dev-GetGameDetailsFunction-iaA0IoiOjCc1', !Ref GetGameDetailsFunction]
+      Events:
+        AddGame:
+          Type: Api
+          Properties:
+            Path: /add-game
+            Method: post
+            RestApiId: !Ref GatewayApi
+
+Outputs:
+  WebsiteURL:
+    Value: !GetAtt RootBucket.WebsiteURL
+    Description: URL for website hosted on S3
